@@ -1,0 +1,25 @@
+# =============================================================================
+# 严格验证环境专用依赖（新建 conda 环境后单独 pip install -r 本文件）
+# 目的：钉死 transformers<5，降低 FlagEmbedding（BGE-M3 / FlagReranker）与 HF 栈不兼容概率
+# 注意：不要覆盖或替换仓库根目录的 requirements.txt；旧环境保持不动
+# =============================================================================
+
+# --- 核心：版本上界避免 transformers 5.x 移除 import_utils 中旧符号导致 FlagEmbedding 崩 ---
+torch>=2.1.0,<2.6.0
+transformers>=4.41.0,<5.0.0
+sentence-transformers>=3.0.1,<3.4.0
+FlagEmbedding>=1.2.10,<1.4.0
+
+# --- 与本项目 API / 服务同版本（与主 requirements 对齐，便于同一套代码跑通）---
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+rank-bm25>=0.2.2
+faiss-cpu>=1.8.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+pytest>=8.2.0
+httpx>=0.27.0
+pypdf>=4.2.0
+streamlit>=1.36.0

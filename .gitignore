@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual env
+.venv/
+venv/
+env/
+project2_rag/
+project2_rag_strict/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Logs
+*.log
+
+# Cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.huggingface/
+hf_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / artifacts
+dist/
+build/
+*.egg-info/
+artifacts/
+
+# Model / local data cache
+models/
+checkpoints/
+downloads/
+
+# Optional: large local outputs
+*.png
+*.jpg
+*.jpeg
+*.webp

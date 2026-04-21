@@ -1,0 +1,9 @@
+{"id": "demo-faq-01", "category": "faq", "query": "老师在作业批改台里找不到作业发布入口，是入口改版了吗？", "note": "典型工单问法，期望 BM25 FAQ 直出"}
+{"id": "demo-faq-02", "category": "faq", "query": "字典操作相关入口在教师端哪里？", "note": "短问句 + 入口类关键词"}
+{"id": "demo-platform-01", "category": "platform_usage", "query": "Python基础这节课的导入环节老师反馈有点生硬，想找一个能自然引到字符串处理的案例。", "note": "偏平台/课程设计长问，期望走混合检索 RAG"}
+{"id": "demo-code-01", "category": "code_error", "query": "运行时出现 TypeError，代码里 print(x[0]) 这一行触发了，请问常见原因是什么？", "note": "含错误类型与代码片段，query 分类偏代码报错"}
+{"id": "demo-clarify-01", "category": "need_clarify", "query": "这个怎么办？", "note": "指代不明短问，期望 need_clarify"}
+{"id": "demo-clarify-02", "category": "need_clarify", "query": "我这里报错了怎么回事", "note": "提报错但缺少细节，期望 need_clarify"}
+{"id": "demo-hyde-01", "category": "hyde", "query": "我在准备一节小学用海龟绘图导入课，总是担心学生跟不上节奏，希望你从课堂组织角度给我一些可操作的建议，并说明如何过渡到画笔坐标概念。", "note": "长问 + 希望/建议/如何，期望 HyDE 路由"}
+{"id": "demo-subquery-01", "category": "subquery", "query": "作业批改台找不到作业发布入口怎么办？另外学生端为什么看不到作业列表？", "note": "并列多意图，期望 subquery"}
+{"id": "demo-backtrack-01", "category": "backtrack", "query": "紫色虚构模块 zk9 的隐藏入口在哪里？", "note": "弱相关虚构词，首轮分数可能偏低；是否出现 backtrack 以 route_trace 为准"}

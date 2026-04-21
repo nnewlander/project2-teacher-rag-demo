@@ -1,0 +1,60 @@
+{
+  "raw_documents_10pct.jsonl": {
+    "record_id": "文档ID",
+    "source_type": "文档类型：课程文档/教师手册/平台指南/OCR文档/外部参考",
+    "content_origin": "internal 或 external",
+    "file_name": "原始文件名",
+    "file_type": "pdf/docx/html/md/png_ocr",
+    "title": "标题",
+    "department": "来源部门",
+    "product_module": "系统模块",
+    "course_stage": "课程阶段",
+    "knowledge_tags": "知识点标签数组",
+    "version": "版本号",
+    "status": "current/deprecated/draft",
+    "duplicate_group_id": "疑似重复组ID",
+    "noise_flags": "噪声标记",
+    "raw_text": "原始文本"
+  },
+  "raw_support_tickets_10pct.jsonl": {
+    "ticket_id": "工单ID",
+    "channel": "来源渠道",
+    "issue_type": "问题类型",
+    "conversation_turns": "多轮会话数组",
+    "raw_question": "原始问题文本",
+    "raw_resolution_note": "原始解决说明",
+    "related_error_type": "关联报错类型",
+    "related_doc_ids": "关联文档ID",
+    "noise_flags": "噪声标记"
+  },
+  "raw_code_examples_10pct.jsonl": {
+    "example_id": "代码示例ID",
+    "topic": "主题",
+    "code": "代码内容",
+    "expected_output": "期望输出",
+    "explanation_raw": "说明文本",
+    "common_errors": "常见错误"
+  },
+  "raw_faq_10pct.jsonl": {
+    "faq_id": "FAQ ID",
+    "question": "原始问法",
+    "standard_question": "标准问法",
+    "answer_raw": "原始答案",
+    "hit_count_30d": "近30天命中数",
+    "noise_flags": "噪声标记"
+  },
+  "raw_external_refs_10pct.jsonl": {
+    "ext_id": "外部资料ID",
+    "source_site": "来源站点",
+    "title": "标题",
+    "url": "来源地址",
+    "raw_text": "原始文本"
+  },
+  "route_eval_queries_10pct.jsonl": {
+    "query_id": "查询ID",
+    "raw_query": "原始查询",
+    "route_label": "应走的策略路由",
+    "need_rewrite": "是否需要查询改写",
+    "need_clarify": "是否需要澄清"
+  }
+}
