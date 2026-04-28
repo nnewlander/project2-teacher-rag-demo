@@ -119,18 +119,32 @@ class QAService:
         bm25_ready = bool(getattr(self.faq, "_bm25", None) is not None)
         vector_ready = bool(getattr(self.vec, "_index", None) is not None)
         model_loaded = bool(getattr(self.vec, "_model", None) is not None)
-        ready = bool(self._ready and faq_ready and bm25_ready and vector_ready)
         faq_doc_count = int(len(getattr(self.faq, "_faq_docs", []) or []))
         bm25_doc_count = int(len(getattr(self.faq, "_corpus_tokens", []) or []))
         lightweight_ready = bool(faq_ready and bm25_ready)
+        fallback_ready = True
+        lightweight_search_ready = bool(faq_ready and bm25_ready)
+        full_rag_ready = bool(vector_ready and model_loaded)
+        serving_mode = "full_rag" if full_rag_ready else ("lightweight_search" if lightweight_search_ready else "fallback_only")
+        if full_rag_ready:
+            status = "ready"
+        elif lightweight_search_ready:
+            status = "partial_ready"
+        elif fallback_ready:
+            status = "fallback_only"
+        else:
+            status = "not_ready"
         return {
-            "status": "ready" if ready else "not_ready",
+            "status": status,
             "faq_ready": faq_ready,
             "bm25_ready": bm25_ready,
             "vector_ready": vector_ready,
             "model_loaded": model_loaded,
             "lightweight_ready": lightweight_ready,
-            "fallback_ready": True,
+            "fallback_ready": fallback_ready,
+            "lightweight_search_ready": lightweight_search_ready,
+            "full_rag_ready": full_rag_ready,
+            "serving_mode": serving_mode,
             "search_mode": str(getattr(self.settings, "search_mode", "lightweight") or "lightweight"),
             "vector_enabled_for_search": str(getattr(self.settings, "search_mode", "lightweight") or "lightweight").lower() == "hybrid",
             "embedding_model_cached": bool(getattr(self.vec, "_model", None) is not None),

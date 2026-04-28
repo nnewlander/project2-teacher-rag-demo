@@ -97,8 +97,10 @@ def test_ready_fast_response() -> None:
     assert r.status_code == 200
     assert cost < 1.0
     data = r.json()
-    assert data["status"] in ("ready", "not_ready")
+    assert data["status"] in ("ready", "partial_ready", "fallback_only", "not_ready")
     for k in ("faq_ready", "bm25_ready", "vector_ready", "model_loaded", "lightweight_ready", "fallback_ready"):
+        assert k in data
+    for k in ("lightweight_search_ready", "full_rag_ready", "serving_mode"):
         assert k in data
     for k in ("faq_doc_count", "bm25_doc_count", "last_warmup_error", "last_warmup_cost_ms"):
         assert k in data
@@ -171,6 +173,9 @@ def test_warmup_enables_real_faq_and_search_prefers_real_hit() -> None:
     assert w.status_code == 200
     wj = w.json()
     assert wj["status"] == "ok"
+    assert wj["lightweight_search_ready"] is True
+    assert wj["full_rag_ready"] is False
+    assert wj["serving_mode"] == "lightweight_search"
 
     r = client.get("/ready")
     assert r.status_code == 200
@@ -178,6 +183,10 @@ def test_warmup_enables_real_faq_and_search_prefers_real_hit() -> None:
     assert ready["faq_ready"] is True
     assert ready["bm25_ready"] is True
     assert ready["lightweight_ready"] is True
+    assert ready["lightweight_search_ready"] is True
+    assert ready["full_rag_ready"] is False
+    assert ready["status"] == "partial_ready"
+    assert ready["serving_mode"] == "lightweight_search"
 
     s = client.post(
         "/search",

@@ -30,14 +30,21 @@ def health() -> dict:
 def ready() -> dict:
     global _qa
     if _qa is None:
+        fallback_ready = True
+        lightweight_search_ready = False
+        full_rag_ready = False
+        serving_mode = "fallback_only"
         return {
-            "status": "not_ready",
+            "status": "fallback_only",
             "faq_ready": False,
             "bm25_ready": False,
             "vector_ready": False,
             "model_loaded": False,
             "lightweight_ready": False,
-            "fallback_ready": True,
+            "fallback_ready": fallback_ready,
+            "lightweight_search_ready": lightweight_search_ready,
+            "full_rag_ready": full_rag_ready,
+            "serving_mode": serving_mode,
             "search_mode": str(get_settings().search_mode or "lightweight"),
             "vector_enabled_for_search": str(get_settings().search_mode or "lightweight").lower() == "hybrid",
             "embedding_model_cached": False,
@@ -61,6 +68,18 @@ def warmup() -> dict:
             "bm25_ready": bool(out.get("bm25_ready")),
             "vector_ready": bool(out.get("vector_ready")),
             "model_loaded": bool(out.get("model_loaded")),
+            "lightweight_ready": bool(out.get("lightweight_ready")),
+            "fallback_ready": bool(out.get("fallback_ready")),
+            "lightweight_search_ready": bool(out.get("lightweight_search_ready")),
+            "full_rag_ready": bool(out.get("full_rag_ready")),
+            "serving_mode": out.get("serving_mode"),
+            "search_mode": out.get("search_mode"),
+            "vector_enabled_for_search": bool(out.get("vector_enabled_for_search")),
+            "embedding_model_cached": bool(out.get("embedding_model_cached")),
+            "faq_doc_count": int(out.get("faq_doc_count") or 0),
+            "bm25_doc_count": int(out.get("bm25_doc_count") or 0),
+            "last_warmup_error": out.get("last_warmup_error"),
+            "last_warmup_cost_ms": out.get("last_warmup_cost_ms"),
             "cost_ms": out.get("cost_ms"),
         }
     return {
@@ -69,6 +88,18 @@ def warmup() -> dict:
         "bm25_ready": bool(out.get("bm25_ready")),
         "vector_ready": bool(out.get("vector_ready")),
         "model_loaded": bool(out.get("model_loaded")),
+        "lightweight_ready": bool(out.get("lightweight_ready")),
+        "fallback_ready": bool(out.get("fallback_ready")),
+        "lightweight_search_ready": bool(out.get("lightweight_search_ready")),
+        "full_rag_ready": bool(out.get("full_rag_ready")),
+        "serving_mode": out.get("serving_mode"),
+        "search_mode": out.get("search_mode"),
+        "vector_enabled_for_search": bool(out.get("vector_enabled_for_search")),
+        "embedding_model_cached": bool(out.get("embedding_model_cached")),
+        "faq_doc_count": int(out.get("faq_doc_count") or 0),
+        "bm25_doc_count": int(out.get("bm25_doc_count") or 0),
+        "last_warmup_error": out.get("last_warmup_error"),
+        "last_warmup_cost_ms": out.get("last_warmup_cost_ms"),
         "cost_ms": out.get("cost_ms"),
         "error": out.get("error"),
     }

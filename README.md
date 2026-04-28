@@ -538,6 +538,21 @@ streamlit run streamlit_app.py
 curl http://127.0.0.1:8001/health
 ```
 
+### 11.1.1 就绪状态（`/ready`）
+
+`/ready` 会区分“轻量检索可用”和“完整 RAG 可用”：
+
+- `lightweight_search_ready`：`faq_ready && bm25_ready`
+- `full_rag_ready`：`vector_ready && model_loaded`
+- `serving_mode`：`fallback_only` / `lightweight_search` / `full_rag`
+- `status`：
+  - `ready`（full_rag_ready=true）
+  - `partial_ready`（lightweight_search_ready=true）
+  - `fallback_only`（仅 fallback 可用）
+  - `not_ready`（极少见兜底状态）
+
+说明：当 `search_mode=lightweight` 且完成 `/warmup` 后，通常是 `status=partial_ready`，表示服务可用于项目一的 evidence-only 检索。
+
 ### 11.2 提问（`/ask`）
 
 ```bash
