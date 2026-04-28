@@ -4,12 +4,14 @@ from dataclasses import dataclass
 from pathlib import Path
 import time
 import logging
-from typing import Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import Settings
 from app.schemas.answer import AnswerResponse, Citation, RouteTraceItem
 from app.schemas.document import DocumentChunk, InternalDocument
 from app.schemas.query import RetrievedContext
+from app.schemas.search import SearchHit, SearchResponse
 from app.services.cache import create_answer_cache
 from app.services.chunker import Chunker, ChunkingConfig
 from app.services.cleaner import Cleaner
@@ -34,6 +36,26 @@ class KnowledgeBaseArtifacts:
 
 
 class QAService:
+    _ERROR_TYPE_SYNONYMS: Dict[str, List[str]] = {
+        "NameError": ["变量未定义", "名称未定义", "变量名错误", "函数名未定义"],
+        "TypeError": ["类型错误", "类型不匹配", "参数类型错误"],
+        "SyntaxError": ["语法错误", "冒号缺失", "缩进错误"],
+        "IndexError": ["下标越界", "索引越界"],
+        "KeyError": ["字典键不存在"],
+        "ValueError": ["值错误", "参数值错误"],
+        "ModuleNotFoundError": ["模块未找到", "库未安装"],
+    }
+    _ERROR_TYPE_ORDER: List[str] = [
+        "ModuleNotFoundError",
+        "SyntaxError",
+        "NameError",
+        "TypeError",
+        "IndexError",
+        "KeyError",
+        "ValueError",
+    ]
+    _ERROR_TYPE_RE = re.compile(r"\b(ModuleNotFoundError|SyntaxError|NameError|TypeError|IndexError|KeyError|ValueError)\b", re.IGNORECASE)
+
     """
     串起 MVP 全流程：
     query -> router -> retriever -> context -> answer
@@ -75,6 +97,36 @@ class QAService:
         ask_limit = int(getattr(self.settings, "ask_init_limit", 0) or 0)
         return ask_limit if ask_limit > 0 else None
 
+    def _ensure_initialized(self, limit: Optional[int] = None) -> None:
+        if self._ready:
+            return
+        t0 = time.perf_counter()
+        self._logger.info("start init qa service limit=%s", limit)
+        try:
+            self.init_kb(limit=limit)
+        except Exception:
+            cost = (time.perf_counter() - t0) * 1000
+            self._logger.exception("finish init qa service failed cost_ms=%.2f", cost)
+            raise
+        cost = (time.perf_counter() - t0) * 1000
+        self._logger.info("finish init qa service cost_ms=%.2f", cost)
+
+    def ready_status(self) -> Dict[str, Any]:
+        faq_ready = bool(getattr(self.faq, "_faq_docs", []))
+        bm25_ready = bool(getattr(self.faq, "_bm25", None) is not None)
+        vector_ready = bool(getattr(self.vec, "_index", None) is not None)
+        model_loaded = bool(getattr(self.vec, "_model", None) is not None)
+        ready = bool(self._ready and faq_ready and bm25_ready and vector_ready)
+        return {
+            "status": "ready" if ready else "not_ready",
+            "faq_ready": faq_ready,
+            "bm25_ready": bm25_ready,
+            "vector_ready": vector_ready,
+            "model_loaded": model_loaded,
+            "lightweight_ready": True,
+            "fallback_ready": True,
+        }
+
     def init_kb(self, limit: Optional[int] = None) -> KnowledgeBaseArtifacts:
         # 1) load raw -> internal docs
         docs_records = self.loader.load_raw_records("document", Path(self.settings.raw_documents_path), limit=limit)
@@ -114,7 +166,7 @@ class QAService:
         }
         ask_init_limit = self._pick_ask_init_limit()
         if not self._ready:
-            self.init_kb(limit=ask_init_limit)
+            self._ensure_initialized(limit=ask_init_limit)
             kb_init_debug = {
                 "phase": "ask_init",
                 "requested_limit": ask_init_limit,
@@ -524,6 +576,247 @@ class QAService:
         self._logger.info("ask route=rag_standard fallback backtrack=%s", did_backtrack)
         return resp
 
+    def search(self, query: str, top_k: int = 3, filters: Optional[Dict[str, object]] = None, request_id: Optional[str] = None) -> SearchResponse:
+        """
+        仅检索证据，不调用 LLM，不走 /ask 生成链路。
+        """
+        _ = filters or {}
+        _ = request_id
+        t_total0 = time.perf_counter()
+        deadline = t_total0 + 5.0
+        timings: Dict[str, float] = {}
+        warnings: List[str] = []
+        errors: List[str] = []
+        hybrid_skipped = False
+        fallback_inserted = False
+        fast_path_used = False
+        top_hit_reason = "no_hits"
+        rerank_debug: Dict[str, Any] = {"enabled": False}
+
+        t0 = time.perf_counter()
+        qp = self.query_processor.process(query)
+        timings["query_process"] = round((time.perf_counter() - t0) * 1000, 2)
+        cleaned = qp.cleaned_query
+        if not cleaned:
+            return SearchResponse(
+                hits=[],
+                query=query,
+                route_trace=["query_clean"],
+                debug={
+                    "top_k": max(1, int(top_k)),
+                    "retriever": "local/mock",
+                    "reason": "empty_query",
+                    "timing_ms": {**timings, "total": round((time.perf_counter() - t_total0) * 1000, 2)},
+                },
+            )
+
+        t0 = time.perf_counter()
+        detected_error_type = self._detect_error_type(cleaned)
+        timings["detect_error_type"] = round((time.perf_counter() - t0) * 1000, 2)
+        expanded_terms = self._expand_error_terms(cleaned, detected_error_type)
+        normalized_query = self._build_search_query(cleaned, expanded_terms)
+
+        t0 = time.perf_counter()
+        decision = self.router.decide(normalized_query, query_type=qp.query_type)
+        timings["route"] = round((time.perf_counter() - t0) * 1000, 2)
+        route_trace = ["query_clean", "retrieve", "rerank"]
+        hk = max(1, int(top_k))
+        route_tag = "rag_standard"
+        contexts: List[RetrievedContext] = []
+        ef_filtered_out = 0
+        retriever_name = f"bm25+{self.settings.vector_store_backend}"
+        vector_optional = bool(detected_error_type)
+
+        if detected_error_type:
+            fast_path_used = True
+            warnings.append("stage skipped: vector optional for error_type")
+
+        if not self._ready and not detected_error_type:
+            ask_init_limit = self._pick_ask_init_limit()
+            try:
+                self._ensure_initialized(limit=ask_init_limit)
+            except Exception as e:
+                return SearchResponse(
+                    hits=[],
+                    query=query,
+                    route_trace=route_trace,
+                    debug={
+                        "top_k": hk,
+                        "retriever": "init_failed",
+                        "warnings": warnings + ["fallback used: init_failed"],
+                        "errors": [f"init_failed:{e!r}"],
+                        "detected_error_type": detected_error_type,
+                        "timing_ms": self._finalize_timeout_timings(timings, t_total0),
+                    },
+                )
+
+        # error_type 快速路径：不等待 vector/model 初始化；若 FAQ 未 ready，直接 fallback
+        if detected_error_type and not self._ready:
+            warnings.append("fallback used: resources not_ready")
+            timings["faq_search"] = 0.0
+            timings["phrase_match"] = 0.0
+            timings["hybrid_retrieve"] = 0.0
+            timings["rerank_boost"] = 0.0
+            t_fb0 = time.perf_counter()
+            fallback_hit = self._build_error_fallback_hit(detected_error_type, route="error_fast_path")
+            fallback_inserted = True
+            timings["fallback_build"] = round((time.perf_counter() - t_fb0) * 1000, 2)
+            timings = self._finalize_timeout_timings(timings, t_total0)
+            return SearchResponse(
+                hits=[fallback_hit],
+                query=query,
+                route_trace=route_trace,
+                debug={
+                    "top_k": hk,
+                    "retriever": "fallback_only",
+                    "filtered_out_count": 0,
+                    "request_query_type": qp.query_type,
+                    "normalized_query": normalized_query,
+                    "detected_error_type": detected_error_type,
+                    "expanded_terms": expanded_terms,
+                    "rerank_boost_applied": {"enabled": False, "reason": "fallback_only"},
+                    "top_hit_reason": "fallback_not_ready",
+                    "fast_path_used": True,
+                    "vector_optional": True,
+                    "hybrid_skipped": True,
+                    "fallback_inserted": fallback_inserted,
+                    "warnings": warnings,
+                    "errors": errors,
+                    "timing_ms": timings,
+                    "llm_called": False,
+                },
+            )
+
+        t0 = time.perf_counter()
+        faq_hits = self.faq.search(normalized_query, top_k=max(int(self.settings.faq_top_k), hk)) if self._ready else []
+        timings["faq_search"] = round((time.perf_counter() - t0) * 1000, 2)
+        if faq_hits:
+            contexts = self.faq.as_contexts(faq_hits[:hk])
+            route_tag = "bm25_faq"
+        timings["phrase_match"] = round((time.perf_counter() - t0) * 1000, 2)
+
+        if detected_error_type and len(contexts) >= hk:
+            fast_path_used = True
+            hybrid_skipped = True
+            warnings.append("stage skipped: hybrid by error_type fast path")
+
+        if not hybrid_skipped:
+            # 错误类型 query 的优先快路径：FAQ 有结果时不强制进入向量检索
+            if detected_error_type and contexts:
+                fast_path_used = True
+                hybrid_skipped = True
+                warnings.append("stage skipped: hybrid with faq hits")
+            else:
+                retrieve_query = normalized_query
+                if decision.route == "hyde":
+                    hy = self.hyde.generate(normalized_query)
+                    if hy.hyde_text.strip():
+                        retrieve_query = hy.hyde_text.strip()
+                t0 = time.perf_counter()
+                try:
+                    if time.perf_counter() >= deadline:
+                        raise TimeoutError("search total timeout before hybrid")
+                    result = self.hybrid.retrieve(
+                        retrieve_query,
+                        faq_top_k=int(self.settings.faq_top_k),
+                        vec_top_k=int(self.settings.vector_top_k),
+                        hybrid_top_k=hk,
+                    )
+                    hybrid_ms = (time.perf_counter() - t0) * 1000
+                    timings["hybrid_retrieve"] = round(hybrid_ms, 2)
+                    if hybrid_ms > 3000:
+                        hybrid_skipped = True
+                        warnings.append("stage timeout: hybrid_retrieve over 3s")
+                        warnings.append("fallback used: keep existing hits")
+                    else:
+                        contexts = (contexts + (result.contexts if result else []))[: max(hk, int(self.settings.hybrid_top_k))]
+                        route_tag = "rag_standard"
+                        rerank_type = (((result.debug if result else {}) or {}).get("rerank") or {}).get("type")
+                        if rerank_type:
+                            retriever_name = f"{retriever_name}/{rerank_type}"
+                    if time.perf_counter() >= deadline:
+                        warnings.append("stage timeout: total timeout guard after hybrid")
+                except Exception as e:
+                    timings["hybrid_retrieve"] = round((time.perf_counter() - t0) * 1000, 2)
+                    warnings.append("hybrid_exception")
+                    errors.append(f"hybrid_exception:{e!r}")
+                    self._logger.warning("search hybrid exception: %r", e)
+        else:
+            timings["hybrid_retrieve"] = 0.0
+
+        if time.perf_counter() >= deadline:
+            warnings.append("stage timeout: timeout_guard")
+            warnings.append("skipped stage: filter/rerank partial")
+        t0 = time.perf_counter()
+        ef = filter_evidence(query=normalized_query, contexts=contexts[:hk], settings=self.settings)
+        timings["filter_evidence"] = round((time.perf_counter() - t0) * 1000, 2)
+        ef_filtered_out = ef.filtered_out_count
+        hits = self._to_search_hits(ef.kept[:hk], route=route_tag)
+
+        t0 = time.perf_counter()
+        reranked_hits, rerank_debug, top_hit_reason = self._rerank_search_hits(
+            hits, detected_error_type=detected_error_type, expanded_terms=expanded_terms
+        )
+        timings["rerank_boost"] = round((time.perf_counter() - t0) * 1000, 2)
+
+        t0 = time.perf_counter()
+        final_hits, inserted = self._ensure_error_fallback_hits(
+            reranked_hits,
+            detected_error_type=detected_error_type,
+            expanded_terms=expanded_terms,
+            query=query,
+            top_k=hk,
+            route=route_tag,
+        )
+        fallback_inserted = inserted
+        if inserted:
+            warnings.append("fallback used: inserted_error_evidence")
+        timings["fallback_build"] = round((time.perf_counter() - t0) * 1000, 2)
+        timings = self._finalize_timeout_timings(timings, t_total0)
+
+        self._logger.info(
+            "search timing_ms=%s error_type=%s fast_path=%s hybrid_skipped=%s fallback=%s",
+            timings,
+            detected_error_type,
+            fast_path_used,
+            hybrid_skipped,
+            fallback_inserted,
+        )
+
+        return SearchResponse(
+            hits=final_hits[:hk],
+            query=query,
+            route_trace=route_trace,
+            debug={
+                "top_k": hk,
+                "retriever": retriever_name,
+                "filtered_out_count": ef_filtered_out,
+                "request_query_type": qp.query_type,
+                "normalized_query": normalized_query,
+                "detected_error_type": detected_error_type,
+                "expanded_terms": expanded_terms,
+                "rerank_boost_applied": rerank_debug,
+                "top_hit_reason": top_hit_reason,
+                "fast_path_used": fast_path_used,
+                "vector_optional": vector_optional,
+                "hybrid_skipped": hybrid_skipped,
+                "fallback_inserted": fallback_inserted,
+                "warnings": warnings,
+                "errors": errors,
+                "timing_ms": timings,
+                "llm_called": False,
+            },
+        )
+
+    def _finalize_timeout_timings(self, timings: Dict[str, float], t_total0: float) -> Dict[str, float]:
+        merged = dict(timings)
+        merged["timeout_guard"] = round(max(0.0, 5000.0 - ((time.perf_counter() - t_total0) * 1000)), 2)
+        merged["total"] = round((time.perf_counter() - t_total0) * 1000, 2)
+        # 统一补齐关键字段，便于前端稳定读取
+        for k in ("detect_error_type", "fallback_build", "faq_search", "phrase_match", "rerank_boost", "hybrid_retrieve"):
+            merged.setdefault(k, 0.0)
+        return merged
+
     def _is_weak_retrieval(self, contexts: List[RetrievedContext]) -> bool:
         if not contexts:
             return True
@@ -701,6 +994,163 @@ class QAService:
                 )
             )
         return out
+
+    def _to_search_hits(self, contexts: List[RetrievedContext], *, route: str) -> List[SearchHit]:
+        out: List[SearchHit] = []
+        for c in contexts:
+            meta = c.metadata if isinstance(c.metadata, dict) else {}
+            source_type = str(meta.get("source") or c.source)
+            title = str(meta.get("title") or c.source_id)
+            snippet = (c.text or "").strip().replace("\n", " ")
+            if len(snippet) > 220:
+                snippet = snippet[:220] + "..."
+            out.append(
+                SearchHit(
+                    source_id=c.source_id,
+                    title=title,
+                    snippet=snippet,
+                    score=float(c.score),
+                    source_type=source_type,
+                    metadata={**{k: v for k, v in meta.items()}, "route": route},
+                )
+            )
+        return out
+
+    def _detect_error_type(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        found = self._ERROR_TYPE_RE.findall(text)
+        if not found:
+            return None
+        normalized = {x.lower(): x for x in self._ERROR_TYPE_ORDER}
+        for m in found:
+            key = str(m).lower()
+            if key in normalized:
+                return normalized[key]
+        return None
+
+    def _expand_error_terms(self, query: str, detected_error_type: Optional[str]) -> List[str]:
+        terms: List[str] = []
+        if detected_error_type:
+            terms.append(detected_error_type)
+            terms.extend(self._ERROR_TYPE_SYNONYMS.get(detected_error_type, []))
+        # 保底补充常见代码报错类术语，利于 faq/vector 双路召回
+        for t in ["报错排查", "课堂演示", "代码调试"]:
+            if t not in query:
+                terms.append(t)
+        # 去重并保持顺序
+        out: List[str] = []
+        seen = set()
+        for t in terms:
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+        return out
+
+    def _build_search_query(self, cleaned_query: str, expanded_terms: List[str]) -> str:
+        if not expanded_terms:
+            return cleaned_query
+        joined = " ".join(expanded_terms)
+        return f"{cleaned_query} {joined}".strip()
+
+    def _rerank_search_hits(
+        self, hits: List[SearchHit], *, detected_error_type: Optional[str], expanded_terms: List[str]
+    ) -> tuple[List[SearchHit], Dict[str, object], str]:
+        if not hits:
+            return hits, {"enabled": False, "reason": "no_hits"}, "no_hits"
+
+        term_set = {t.lower() for t in expanded_terms if t}
+        if detected_error_type:
+            term_set.add(detected_error_type.lower())
+
+        boosted: List[tuple[float, SearchHit, List[str]]] = []
+        for h in hits:
+            base = float(h.score)
+            reasons: List[str] = []
+            text_blob = " ".join(
+                [
+                    str(h.title or ""),
+                    str(h.snippet or ""),
+                    " ".join([f"{k}:{v}" for k, v in (h.metadata or {}).items()]),
+                ]
+            ).lower()
+            bonus = 0.0
+
+            if detected_error_type and detected_error_type.lower() in text_blob:
+                bonus += 1.5
+                reasons.append("match_error_type")
+
+            matched_terms = [t for t in term_set if t and t in text_blob]
+            if matched_terms:
+                bonus += min(1.0, 0.2 * len(matched_terms))
+                reasons.append(f"match_terms:{len(matched_terms)}")
+
+            category = str((h.metadata or {}).get("category") or "")
+            if category == "代码报错":
+                bonus += 1.2
+                reasons.append("category_code_error")
+                if h.source_type == "faq":
+                    bonus += 0.8
+                    reasons.append("faq_code_error")
+
+            if any(x in text_blob for x in ["变量未定义", "函数未定义", "nameerror"]):
+                bonus += 1.1
+                reasons.append("nameerror_keyword")
+
+            boosted.append((base + bonus, h, reasons))
+
+        boosted.sort(key=lambda x: x[0], reverse=True)
+        reranked_hits = [x[1] for x in boosted]
+        top_reasons = boosted[0][2] if boosted else []
+        debug = {
+            "enabled": True,
+            "detected_error_type": detected_error_type,
+            "boosted_hits": [
+                {"source_id": h.source_id, "boosted_score": round(score, 4), "reasons": reasons}
+                for score, h, reasons in boosted[:5]
+            ],
+        }
+        return reranked_hits, debug, ",".join(top_reasons) if top_reasons else "base_score"
+
+    def _ensure_error_fallback_hits(
+        self,
+        hits: List[SearchHit],
+        *,
+        detected_error_type: Optional[str],
+        expanded_terms: List[str],
+        query: str,
+        top_k: int,
+        route: str,
+    ) -> Tuple[List[SearchHit], bool]:
+        if not detected_error_type:
+            return hits, False
+        lower_terms = [x.lower() for x in ([detected_error_type] + expanded_terms)]
+        for h in hits[: max(1, min(3, len(hits)))]:
+            text_blob = f"{h.title} {h.snippet}".lower()
+            if any(t and t in text_blob for t in lower_terms):
+                return hits, False
+
+        fallback = self._build_error_fallback_hit(detected_error_type, route=route)
+        return [fallback, *hits][: max(1, top_k)], True
+
+    def _build_error_fallback_hit(self, error_type: str, *, route: str) -> SearchHit:
+        if error_type == "NameError":
+            snippet = "NameError 通常表示变量或函数名在使用前未定义，也可能是大小写、拼写或作用域问题。课堂上可以让学生先定位报错行，再检查变量是否先定义后使用。"
+        elif error_type == "TypeError":
+            snippet = "TypeError 常见于参数类型不匹配。建议先确认函数入参类型，再检查字符串与数值混用、None 参与运算等场景。"
+        elif error_type == "SyntaxError":
+            snippet = "SyntaxError 表示语法错误，常见于冒号缺失、括号不配对、缩进错误。可让学生从报错行向上两三行回看结构。"
+        else:
+            snippet = f"{error_type} 排查建议：先阅读完整报错，再核对触发代码上下文与数据输入。"
+        return SearchHit(
+            source_id=f"FALLBACK-{error_type}",
+            title=f"{error_type} 常见原因与课堂解释",
+            snippet=snippet,
+            score=0.99,
+            source_type="fallback_error_guide",
+            metadata={"category": "代码报错", "route": route, "fallback": True, "detected_error_type": error_type},
+        )
 
     def _fallback_answer(self, query: str, contexts: List[RetrievedContext]) -> str:
         """

@@ -166,7 +166,24 @@ requirements-bge-strict.txt
 - `kept_context_count`
 - `debug`
 
-### 5.2 `/health` 的当前设计
+### 5.2 `/search`（evidence-only）接口用途
+
+`/search` 专门用于“只返回检索证据”，不负责生成最终答案，适合被外部系统（如项目一 Agent 平台）通过 HTTP 远程调用。
+
+典型用途：
+
+- 项目一的 `RemoteRAGAdapter` 先调用 `/search` 拿证据
+- 项目一在自身流程中做最终诊断/干预建议生成
+- 项目二保持检索服务职责，不与项目一代码强耦合
+
+`/search` 返回字段固定为：
+
+- `hits`：证据列表（每条含 `source_id/title/snippet/score/source_type/metadata`）
+- `query`：原始 query
+- `route_trace`：检索链路步骤
+- `debug`：检索调试信息（如 `top_k`、retriever 标识等）
+
+### 5.3 `/health` 的当前设计
 
 `/health` 不仅是普通健康检查，还用于项目级初始化验证。
 
@@ -483,7 +500,7 @@ Windows PowerShell：
 pip install -r requirements.txt
 ```
 
-### 10.3 启动 FastAPI
+### 10.3 启动 FastAPI（建议端口 8001）
 
 ```bash
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8001
@@ -509,7 +526,7 @@ streamlit run streamlit_app.py
 curl http://127.0.0.1:8001/health
 ```
 
-### 11.2 提问
+### 11.2 提问（`/ask`）
 
 ```bash
 curl -X POST "http://127.0.0.1:8001/ask" \
@@ -523,6 +540,40 @@ Windows PowerShell：
 curl -X POST "http://127.0.0.1:8001/ask" ^
   -H "Content-Type: application/json" ^
   -d "{\"query\":\"老师在作业批改台里找不到作业发布入口，是入口改版了吗？\",\"top_k\":8}"
+```
+
+### 11.3 检索证据（`/search`）
+
+```bash
+curl -X POST "http://127.0.0.1:8001/search" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"课堂演示遇到 NameError，应该怎么给学生解释？","top_k":3,"filters":{},"request_id":"demo-search-001"}'
+```
+
+Python `requests` 示例（供项目一远程调用）：
+
+```python
+import requests
+
+resp = requests.post(
+    "http://127.0.0.1:8001/search",
+    json={
+        "query": "课堂演示遇到 NameError，应该怎么给学生解释？",
+        "top_k": 3,
+        "filters": {},
+        "request_id": "project1-remote-rag",
+    },
+    timeout=30,
+)
+resp.raise_for_status()
+data = resp.json()
+hits = data["hits"]
+```
+
+如果你已启动本项目服务，也可以运行脚本快速验证：
+
+```bash
+python -m scripts.test_search_api --base-url http://127.0.0.1:8001 --top-k 3
 ```
 
 ---
