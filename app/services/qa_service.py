@@ -92,6 +92,9 @@ class QAService:
         self._query_counts: Dict[str, int] = {}
 
         self._logger = logging.getLogger("kbqa.qa")
+        # 轻量 warmup（FAQ/BM25）状态
+        self._last_warmup_error: Optional[str] = None
+        self._last_warmup_cost_ms: Optional[float] = None
 
     def _pick_ask_init_limit(self) -> Optional[int]:
         ask_limit = int(getattr(self.settings, "ask_init_limit", 0) or 0)
@@ -117,15 +120,97 @@ class QAService:
         vector_ready = bool(getattr(self.vec, "_index", None) is not None)
         model_loaded = bool(getattr(self.vec, "_model", None) is not None)
         ready = bool(self._ready and faq_ready and bm25_ready and vector_ready)
+        faq_doc_count = int(len(getattr(self.faq, "_faq_docs", []) or []))
+        bm25_doc_count = int(len(getattr(self.faq, "_corpus_tokens", []) or []))
+        lightweight_ready = bool(faq_ready and bm25_ready)
         return {
             "status": "ready" if ready else "not_ready",
             "faq_ready": faq_ready,
             "bm25_ready": bm25_ready,
             "vector_ready": vector_ready,
             "model_loaded": model_loaded,
-            "lightweight_ready": True,
+            "lightweight_ready": lightweight_ready,
             "fallback_ready": True,
+            "search_mode": str(getattr(self.settings, "search_mode", "lightweight") or "lightweight"),
+            "vector_enabled_for_search": str(getattr(self.settings, "search_mode", "lightweight") or "lightweight").lower() == "hybrid",
+            "embedding_model_cached": bool(getattr(self.vec, "_model", None) is not None),
+            "faq_doc_count": faq_doc_count,
+            "bm25_doc_count": bm25_doc_count,
+            "last_warmup_error": self._last_warmup_error,
+            "last_warmup_cost_ms": self._last_warmup_cost_ms,
         }
+
+    def warmup_lightweight(self, *, limit: Optional[int] = None) -> Dict[str, Any]:
+        """
+        轻量 warmup：只初始化 FAQ/BM25，不加载 embedding model，不构建向量索引。
+        """
+        t0 = time.perf_counter()
+        self._last_warmup_error = None
+        self._last_warmup_cost_ms = None
+        try:
+            faq_records = self.loader.load_raw_records("faq", Path(self.settings.raw_faq_path), limit=limit)
+            docs = self.loader.to_internal_documents(faq_records)
+            docs = self.cleaner.clean_documents(docs)
+
+            # 最小种子 FAQ：确保代码报错类在无数据/弱数据时也可被 BM25 命中
+            docs.extend(self._seed_error_faq_documents())
+            docs = self.cleaner.clean_documents(docs)
+
+            faq_docs = [d for d in docs if d.source == "faq"]
+            self.faq.build(faq_docs)
+            cost_ms = (time.perf_counter() - t0) * 1000
+            self._last_warmup_cost_ms = round(cost_ms, 2)
+            self._logger.info("warmup lightweight ok cost_ms=%.2f faq_docs=%d", cost_ms, len(faq_docs))
+            return {"ok": True, "cost_ms": self._last_warmup_cost_ms, **self.ready_status()}
+        except Exception as e:
+            cost_ms = (time.perf_counter() - t0) * 1000
+            self._last_warmup_cost_ms = round(cost_ms, 2)
+            self._last_warmup_error = repr(e)
+            self._logger.warning("warmup lightweight failed cost_ms=%.2f err=%r", cost_ms, e)
+            return {"ok": False, "cost_ms": self._last_warmup_cost_ms, "error": self._last_warmup_error, **self.ready_status()}
+
+    def _seed_error_faq_documents(self) -> List[InternalDocument]:
+        seeds: List[InternalDocument] = []
+        seeds.append(
+            InternalDocument(
+                doc_id="seed-faq-nameerror",
+                source="faq",
+                title="NameError 常见原因说明",
+                text="NameError 通常表示变量或函数名在使用前未定义，也可能是大小写、拼写或作用域问题。",
+                metadata={
+                    "question": "课堂演示遇到 NameError，应该怎么给学生解释？",
+                    "answer": "先定位报错行，再检查变量/函数是否先定义后使用；检查拼写/大小写；检查作用域（函数内外、for/if 代码块）。",
+                    "category": "代码报错",
+                },
+            )
+        )
+        seeds.append(
+            InternalDocument(
+                doc_id="seed-faq-typeerror",
+                source="faq",
+                title="TypeError 常见原因说明",
+                text="TypeError 常见于参数类型不匹配、对 None 做运算、字符串与数值混用。",
+                metadata={
+                    "question": "课堂上遇到 TypeError，怎么排查？",
+                    "answer": "先看报错提示的操作符/函数，再确认入参类型；逐步 print/type 检查；避免 None 参与运算；必要时做显式类型转换。",
+                    "category": "代码报错",
+                },
+            )
+        )
+        seeds.append(
+            InternalDocument(
+                doc_id="seed-faq-syntaxerror",
+                source="faq",
+                title="SyntaxError 常见原因说明",
+                text="SyntaxError 表示语法错误，常见于冒号缺失、括号不配对、缩进错误。",
+                metadata={
+                    "question": "SyntaxError 报错怎么讲解更清楚？",
+                    "answer": "让学生从报错行往上回看结构：if/for/def 是否漏冒号；括号是否配对；缩进是否一致；先保证代码能运行再优化写法。",
+                    "category": "代码报错",
+                },
+            )
+        )
+        return seeds
 
     def init_kb(self, limit: Optional[int] = None) -> KnowledgeBaseArtifacts:
         # 1) load raw -> internal docs
@@ -590,8 +675,26 @@ class QAService:
         hybrid_skipped = False
         fallback_inserted = False
         fast_path_used = False
+        real_retrieval_used = False
+        fallback_only = False
+        fallback_reason: Optional[str] = None
+        real_hit_count = 0
+        real_top1_source_id: Optional[str] = None
+        real_top1_relevance_reason: Optional[str] = None
         top_hit_reason = "no_hits"
         rerank_debug: Dict[str, Any] = {"enabled": False}
+        fallback_insert_position: Optional[int] = None
+        final_top1_source_id: Optional[str] = None
+        final_top1_is_fallback: Optional[bool] = None
+
+        original_query = query
+
+        # SEARCH_MODE：默认 lightweight（不允许加载向量/embedding）
+        settings_mode = str(getattr(self.settings, "search_mode", "lightweight") or "lightweight").lower()
+        include_vector = bool((_ or {}).get("include_vector")) if isinstance(_, dict) else False
+        search_mode = "hybrid" if (settings_mode == "hybrid" or include_vector) else "lightweight"
+        vector_used = False
+        model_loaded_before = bool(getattr(self.vec, "_model", None) is not None)
 
         t0 = time.perf_counter()
         qp = self.query_processor.process(query)
@@ -626,12 +729,16 @@ class QAService:
         ef_filtered_out = 0
         retriever_name = f"bm25+{self.settings.vector_store_backend}"
         vector_optional = bool(detected_error_type)
+        resource_state = self.ready_status()
+        faq_bm25_ready = bool(resource_state.get("faq_ready") and resource_state.get("bm25_ready"))
+        lightweight_ready = faq_bm25_ready
 
         if detected_error_type:
             fast_path_used = True
             warnings.append("stage skipped: vector optional for error_type")
 
-        if not self._ready and not detected_error_type:
+        # lightweight 模式下 /search 不允许触发 full init（会构建向量索引并可能加载 embedding）
+        if search_mode == "hybrid" and (not self._ready) and (not detected_error_type):
             ask_init_limit = self._pick_ask_init_limit()
             try:
                 self._ensure_initialized(limit=ask_init_limit)
@@ -650,9 +757,13 @@ class QAService:
                     },
                 )
 
-        # error_type 快速路径：不等待 vector/model 初始化；若 FAQ 未 ready，直接 fallback
-        if detected_error_type and not self._ready:
-            warnings.append("fallback used: resources not_ready")
+        # error_type 快速路径：
+        # - 若 FAQ/BM25 ready：优先真实 FAQ/BM25（phrase match + boost），不足再 fallback
+        # - 若 FAQ/BM25 not ready：直接 fallback（不阻塞）
+        if detected_error_type and not faq_bm25_ready:
+            warnings.append("fallback used: faq/bm25 not_ready")
+            fallback_only = True
+            fallback_reason = "faq_bm25_not_ready"
             timings["faq_search"] = 0.0
             timings["phrase_match"] = 0.0
             timings["hybrid_retrieve"] = 0.0
@@ -671,15 +782,29 @@ class QAService:
                     "retriever": "fallback_only",
                     "filtered_out_count": 0,
                     "request_query_type": qp.query_type,
+                    "original_query": original_query,
                     "normalized_query": normalized_query,
                     "detected_error_type": detected_error_type,
                     "expanded_terms": expanded_terms,
+                    "search_mode": search_mode,
+                    "resource_state": resource_state,
+                    "real_retrieval_used": False,
+                    "real_hit_count": 0,
+                    "real_top1_source_id": None,
+                    "real_top1_relevance_reason": None,
+                    "fallback_only": True,
+                    "fallback_reason": fallback_reason,
                     "rerank_boost_applied": {"enabled": False, "reason": "fallback_only"},
                     "top_hit_reason": "fallback_not_ready",
                     "fast_path_used": True,
                     "vector_optional": True,
+                    "vector_used": False,
+                    "model_loaded_this_request": False,
                     "hybrid_skipped": True,
                     "fallback_inserted": fallback_inserted,
+                    "fallback_insert_position": 0,
+                    "final_top1_source_id": fallback_hit.source_id,
+                    "final_top1_is_fallback": True,
                     "warnings": warnings,
                     "errors": errors,
                     "timing_ms": timings,
@@ -688,11 +813,27 @@ class QAService:
             )
 
         t0 = time.perf_counter()
-        faq_hits = self.faq.search(normalized_query, top_k=max(int(self.settings.faq_top_k), hk)) if self._ready else []
+        faq_hits = self.faq.search(normalized_query, top_k=max(int(self.settings.faq_top_k), hk)) if faq_bm25_ready else []
         timings["faq_search"] = round((time.perf_counter() - t0) * 1000, 2)
         if faq_hits:
             contexts = self.faq.as_contexts(faq_hits[:hk])
             route_tag = "bm25_faq"
+            real_retrieval_used = True
+            real_hit_count = len(faq_hits[:hk])
+
+        # error_type：补充 phrase match（不依赖中文分词），保证英文异常名可命中 seed/真实 FAQ
+        t0 = time.perf_counter()
+        if detected_error_type and faq_bm25_ready:
+            pm_ctxs = self._phrase_match_faq(detected_error_type, expanded_terms, top_k=hk)
+            if pm_ctxs:
+                # phrase match 结果优先（再拼接 BM25 命中，去重）
+                uniq: Dict[str, RetrievedContext] = {}
+                for c in [*pm_ctxs, *contexts]:
+                    uniq[str(c.source_id)] = c
+                contexts = list(uniq.values())[:hk]
+                route_tag = "bm25_faq"
+                real_retrieval_used = True
+                real_hit_count = max(real_hit_count, len(pm_ctxs))
         timings["phrase_match"] = round((time.perf_counter() - t0) * 1000, 2)
 
         if detected_error_type and len(contexts) >= hk:
@@ -707,40 +848,47 @@ class QAService:
                 hybrid_skipped = True
                 warnings.append("stage skipped: hybrid with faq hits")
             else:
-                retrieve_query = normalized_query
-                if decision.route == "hyde":
-                    hy = self.hyde.generate(normalized_query)
-                    if hy.hyde_text.strip():
-                        retrieve_query = hy.hyde_text.strip()
-                t0 = time.perf_counter()
-                try:
-                    if time.perf_counter() >= deadline:
-                        raise TimeoutError("search total timeout before hybrid")
-                    result = self.hybrid.retrieve(
-                        retrieve_query,
-                        faq_top_k=int(self.settings.faq_top_k),
-                        vec_top_k=int(self.settings.vector_top_k),
-                        hybrid_top_k=hk,
-                    )
-                    hybrid_ms = (time.perf_counter() - t0) * 1000
-                    timings["hybrid_retrieve"] = round(hybrid_ms, 2)
-                    if hybrid_ms > 3000:
-                        hybrid_skipped = True
-                        warnings.append("stage timeout: hybrid_retrieve over 3s")
-                        warnings.append("fallback used: keep existing hits")
-                    else:
-                        contexts = (contexts + (result.contexts if result else []))[: max(hk, int(self.settings.hybrid_top_k))]
-                        route_tag = "rag_standard"
-                        rerank_type = (((result.debug if result else {}) or {}).get("rerank") or {}).get("type")
-                        if rerank_type:
-                            retriever_name = f"{retriever_name}/{rerank_type}"
-                    if time.perf_counter() >= deadline:
-                        warnings.append("stage timeout: total timeout guard after hybrid")
-                except Exception as e:
-                    timings["hybrid_retrieve"] = round((time.perf_counter() - t0) * 1000, 2)
-                    warnings.append("hybrid_exception")
-                    errors.append(f"hybrid_exception:{e!r}")
-                    self._logger.warning("search hybrid exception: %r", e)
+                if search_mode == "lightweight":
+                    hybrid_skipped = True
+                    warnings.append("stage skipped: hybrid disabled by search_mode=lightweight")
+                else:
+                    retrieve_query = normalized_query
+                    if decision.route == "hyde":
+                        hy = self.hyde.generate(normalized_query)
+                        if hy.hyde_text.strip():
+                            retrieve_query = hy.hyde_text.strip()
+                    t0 = time.perf_counter()
+                    try:
+                        if time.perf_counter() >= deadline:
+                            raise TimeoutError("search total timeout before hybrid")
+                        vector_used = True
+                        result = self.hybrid.retrieve(
+                            retrieve_query,
+                            faq_top_k=int(self.settings.faq_top_k),
+                            vec_top_k=int(self.settings.vector_top_k),
+                            hybrid_top_k=hk,
+                        )
+                        hybrid_ms = (time.perf_counter() - t0) * 1000
+                        timings["hybrid_retrieve"] = round(hybrid_ms, 2)
+                        if hybrid_ms > 3000:
+                            hybrid_skipped = True
+                            warnings.append("stage timeout: hybrid_retrieve over 3s")
+                            warnings.append("fallback used: keep existing hits")
+                        else:
+                            contexts = (contexts + (result.contexts if result else []))[
+                                : max(hk, int(self.settings.hybrid_top_k))
+                            ]
+                            route_tag = "rag_standard"
+                            rerank_type = (((result.debug if result else {}) or {}).get("rerank") or {}).get("type")
+                            if rerank_type:
+                                retriever_name = f"{retriever_name}/{rerank_type}"
+                        if time.perf_counter() >= deadline:
+                            warnings.append("stage timeout: total timeout guard after hybrid")
+                    except Exception as e:
+                        timings["hybrid_retrieve"] = round((time.perf_counter() - t0) * 1000, 2)
+                        warnings.append("hybrid_exception")
+                        errors.append(f"hybrid_exception:{e!r}")
+                        self._logger.warning("search hybrid exception: %r", e)
         else:
             timings["hybrid_retrieve"] = 0.0
 
@@ -760,19 +908,35 @@ class QAService:
         timings["rerank_boost"] = round((time.perf_counter() - t0) * 1000, 2)
 
         t0 = time.perf_counter()
-        final_hits, inserted = self._ensure_error_fallback_hits(
+        # 记录真实 top1（fallback 之前）
+        if reranked_hits:
+            real_top1_source_id = reranked_hits[0].source_id
+            real_top1_relevance_reason = self._relevance_reason_for_hit(
+                reranked_hits[0], detected_error_type=detected_error_type, expanded_terms=expanded_terms
+            )
+
+        final_hits, inserted, fallback_insert_position, fallback_reason2 = self._ensure_error_fallback_hits(
             reranked_hits,
             detected_error_type=detected_error_type,
             expanded_terms=expanded_terms,
-            query=query,
             top_k=hk,
             route=route_tag,
         )
         fallback_inserted = inserted
+        if fallback_reason2:
+            fallback_reason = fallback_reason2
         if inserted:
             warnings.append("fallback used: inserted_error_evidence")
+            if fallback_insert_position == 0:
+                fallback_only = (real_hit_count == 0)
         timings["fallback_build"] = round((time.perf_counter() - t0) * 1000, 2)
         timings = self._finalize_timeout_timings(timings, t_total0)
+
+        if final_hits:
+            final_top1_source_id = final_hits[0].source_id
+            final_top1_is_fallback = bool(final_hits[0].metadata.get("fallback")) or (final_hits[0].source_type == "fallback_error_guide")
+        model_loaded_after = bool(getattr(self.vec, "_model", None) is not None)
+        model_loaded_this_request = (not model_loaded_before) and model_loaded_after
 
         self._logger.info(
             "search timing_ms=%s error_type=%s fast_path=%s hybrid_skipped=%s fallback=%s",
@@ -792,21 +956,44 @@ class QAService:
                 "retriever": retriever_name,
                 "filtered_out_count": ef_filtered_out,
                 "request_query_type": qp.query_type,
+                "original_query": original_query,
                 "normalized_query": normalized_query,
                 "detected_error_type": detected_error_type,
                 "expanded_terms": expanded_terms,
+                "search_mode": search_mode,
                 "rerank_boost_applied": rerank_debug,
                 "top_hit_reason": top_hit_reason,
                 "fast_path_used": fast_path_used,
                 "vector_optional": vector_optional,
                 "hybrid_skipped": hybrid_skipped,
                 "fallback_inserted": fallback_inserted,
+                "resource_state": resource_state,
+                "real_retrieval_used": real_retrieval_used,
+                "real_hit_count": real_hit_count,
+                "real_top1_source_id": real_top1_source_id,
+                "real_top1_relevance_reason": real_top1_relevance_reason,
+                "fallback_only": fallback_only,
+                "fallback_reason": fallback_reason,
+                "fallback_insert_position": fallback_insert_position,
+                "final_top1_source_id": final_top1_source_id,
+                "final_top1_is_fallback": final_top1_is_fallback,
+                "vector_used": vector_used,
+                "model_loaded_this_request": model_loaded_this_request,
                 "warnings": warnings,
                 "errors": errors,
                 "timing_ms": timings,
                 "llm_called": False,
             },
         )
+
+    def _relevance_reason_for_hit(self, hit: SearchHit, *, detected_error_type: Optional[str], expanded_terms: List[str]) -> str:
+        blob = f"{hit.title} {hit.snippet}".lower()
+        if detected_error_type and detected_error_type.lower() in blob:
+            return "match_error_type"
+        for t in expanded_terms:
+            if t and str(t).lower() in blob:
+                return f"match_term:{t}"
+        return "no_term_match"
 
     def _finalize_timeout_timings(self, timings: Dict[str, float], t_total0: float) -> Dict[str, float]:
         merged = dict(timings)
@@ -1054,6 +1241,41 @@ class QAService:
         joined = " ".join(expanded_terms)
         return f"{cleaned_query} {joined}".strip()
 
+    def _phrase_match_faq(self, error_type: str, expanded_terms: List[str], *, top_k: int) -> List[RetrievedContext]:
+        """
+        对 FAQ 做子串匹配（phrase match），避免中文分词导致英文异常名召回失败。
+        """
+        docs = getattr(self.faq, "_faq_docs", []) or []
+        if not docs:
+            return []
+        terms = [error_type, *expanded_terms]
+        lowered = [str(t).lower() for t in terms if t]
+        matched: List[Tuple[float, RetrievedContext]] = []
+        for d in docs:
+            meta = d.metadata if isinstance(d.metadata, dict) else {}
+            q = str(meta.get("question") or d.title or "")
+            a = str(meta.get("answer") or "")
+            blob = f"{q}\n{a}\n{d.text}".lower()
+            m = sum(1 for t in lowered if t and t in blob)
+            if m <= 0:
+                continue
+            score = 100.0 + 5.0 * m
+            text = f"FAQ 问：{q}\nFAQ 答：{a}"
+            matched.append(
+                (
+                    score,
+                    RetrievedContext(
+                        source="faq",
+                        source_id=str(d.doc_id),
+                        score=float(score),
+                        text=text,
+                        metadata={"category": str(meta.get("category") or "")},
+                    ),
+                )
+            )
+        matched.sort(key=lambda x: x[0], reverse=True)
+        return [c for _, c in matched[: max(1, int(top_k))]]
+
     def _rerank_search_hits(
         self, hits: List[SearchHit], *, detected_error_type: Optional[str], expanded_terms: List[str]
     ) -> tuple[List[SearchHit], Dict[str, object], str]:
@@ -1119,20 +1341,46 @@ class QAService:
         *,
         detected_error_type: Optional[str],
         expanded_terms: List[str],
-        query: str,
         top_k: int,
         route: str,
-    ) -> Tuple[List[SearchHit], bool]:
+    ) -> Tuple[List[SearchHit], bool, Optional[int], Optional[str]]:
+        """
+        返回：
+        - final_hits
+        - fallback_inserted
+        - fallback_insert_position
+        - fallback_reason
+        """
         if not detected_error_type:
-            return hits, False
-        lower_terms = [x.lower() for x in ([detected_error_type] + expanded_terms)]
-        for h in hits[: max(1, min(3, len(hits)))]:
-            text_blob = f"{h.title} {h.snippet}".lower()
-            if any(t and t in text_blob for t in lower_terms):
-                return hits, False
+            return hits, False, None, None
 
+        # 先按“是否包含 error_type/扩展词”把真实命中提到前面，避免 fallback 覆盖真实相关 FAQ
+        terms = [detected_error_type, *expanded_terms]
+        lowered = [str(t).lower() for t in terms if t]
+
+        def is_relevant(h: SearchHit) -> bool:
+            blob = f"{h.title} {h.snippet}".lower()
+            return any(t and t in blob for t in lowered)
+
+        relevant = [h for h in hits if is_relevant(h)]
+        irrelevant = [h for h in hits if not is_relevant(h)]
+        reordered = [*relevant, *irrelevant]
+
+        # 决定是否插入 fallback
+        if relevant:
+            # 已有真实相关命中：fallback 只做补充，放到末尾（不抢 top1）
+            if len(reordered) >= max(1, top_k):
+                return reordered[: max(1, top_k)], False, None, None
+            fallback = self._build_error_fallback_hit(detected_error_type, route=route)
+            pos = min(len(reordered), max(1, top_k) - 1)
+            out = [*reordered]
+            out.insert(pos, fallback)
+            return out[: max(1, top_k)], True, pos, "supplement_after_relevant_real_hit"
+
+        # 没有任何相关真实命中：fallback 可作为 top1
         fallback = self._build_error_fallback_hit(detected_error_type, route=route)
-        return [fallback, *hits][: max(1, top_k)], True
+        out = [fallback, *reordered]
+        return out[: max(1, top_k)], True, 0, "real_hits_irrelevant_or_empty"
 
     def _build_error_fallback_hit(self, error_type: str, *, route: str) -> SearchHit:
         if error_type == "NameError":
@@ -1149,7 +1397,12 @@ class QAService:
             snippet=snippet,
             score=0.99,
             source_type="fallback_error_guide",
-            metadata={"category": "代码报错", "route": route, "fallback": True, "detected_error_type": error_type},
+            metadata={
+                "category": "代码报错",
+                "route": "fallback_error_guide",
+                "fallback": True,
+                "detected_error_type": error_type,
+            },
         )
 
     def _fallback_answer(self, query: str, contexts: List[RetrievedContext]) -> str:

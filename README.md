@@ -183,6 +183,18 @@ requirements-bge-strict.txt
 - `route_trace`：检索链路步骤
 - `debug`：检索调试信息（如 `top_k`、retriever 标识等）
 
+### 5.2.1 `/search` 的 SEARCH_MODE（推荐项目一使用 lightweight）
+
+`/search` 支持两种检索模式（通过环境变量 `KBQA_SEARCH_MODE` 配置）：
+
+- **lightweight（默认）**：仅使用 FAQ/BM25 + phrase match + rerank boost + fallback，不允许加载向量模型（不会触发 `SentenceTransformer` / embedding / FAISS）。
+- **hybrid**：允许向量检索作为补充（可能触发 embedding/索引初始化），更适合项目二内部实验或完整检索对比。
+
+建议：
+
+- 项目一通过 HTTP 调用项目二 `/search` 时，推荐使用 `KBQA_SEARCH_MODE=lightweight`，确保稳定与低延迟。
+- fallback evidence 仅作为兜底，不应优先覆盖真实 FAQ 命中。
+
 ### 5.3 `/health` 的当前设计
 
 `/health` 不仅是普通健康检查，还用于项目级初始化验证。

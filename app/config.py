@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     vector_top_k: int = 6
     hybrid_top_k: int = 8
 
+    # /search 检索模式：
+    # - lightweight：仅 FAQ/BM25 + phrase match + rerank boost + fallback（默认，供项目一远程调用）
+    # - hybrid：允许向量检索（可能触发 embedding/FAISS 初始化，适合实验或完整检索）
+    search_mode: str = "lightweight"  # lightweight | hybrid
+
     # -------------------------------------------------------------------------
     # Backend 抽象（与项目二简历/文档口径对齐：可切换实现，默认保持当前可运行栈）
     # 说明：以下为「配置契约」；除默认组合外，其它 backend 仅预留占位，不在本仓库接入重依赖。
